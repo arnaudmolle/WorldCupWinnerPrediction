@@ -1,0 +1,211 @@
+################################################################################
+# WC2026 PIPELINE CONFIG
+#
+# This file collects every "choice" / fine-tuned parameter currently
+# hard-coded inside fetch_data.R and simulate.R. Nothing here is wired up
+# automatically yet — treat it as a single reference sheet of every knob
+# that influences the final predictions, with notes on what each one does
+# and, where relevant, WHY it might be producing the odd top-5
+# (Japan / Ecuador / Iran / Morocco) you're seeing.
+#
+# ⚠ ROOT CAUSE (read this first)
+# ------------------------------------------------------------------------
+# `attack_str`, `defence_str`, `form_sc`, `pr_sc`, `q_sc`, `elo_sc` are all
+# rescaled with scales::rescale() across ONLY the 48 qualified teams
+# (min-max to [0,1]). That means a team is scored relative to the *other
+# 47 qualifiers*, not the global pool of ~210 national teams.
+#
+# Combine that with:
+#   - pagerank (h2h_edges) built ONLY from WC-vs-WC matches/qualifiers
+#   - q_pts_per / q_win_rate computed ONLY on qualifier matches
+# ...and a team that steamrolls a weak regional qualifying group (e.g.
+# Japan in AFC, Morocco/Iran in their groups, Ecuador in a thin recent
+# CONMEBOL qualifying window) gets a HIGH relative score on attack/form/
+# pagerank/qualifier axes simply because it never had to play Brazil,
+# France, or Argentina during that window — and once rescaled to [0,1]
+# against the 48-team pool, that dominance looks identical to a European
+# heavyweight grinding out wins against other heavyweights.
+#
+# The two highest-leverage fixes (toggle below):
+#   1. global_rescale: true   -> rescale features against ALL teams in
+#      results.csv, not just the 48 finalists, before computing team_strength.
+#   2. elo_weight: raise to 0.45-0.55 and lower attack/form/pagerank/qual
+#      weights — Elo is computed from the FULL global match history (all
+#      opponents, not just regional ones) so it's much harder to inflate
+#      via a weak schedule.
+################################################################################
+
+paths:
+  data_dir: "data"
+  output_dir: "wc2026_output"
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 1 — Elo ratings (fetch_data.R, Section 3)
+# ──────────────────────────────────────────────────────────────────────────
+elo:
+  elo_start: 1500          # initial rating for every team (incl. teams with no history)
+  elo_k: 30                # K-factor: higher = ratings swing faster on a single result.
+                            # 20-30 is standard for international football models.
+  home_advantage: 100      # Elo points added to the home side when match isn't neutral.
+                            # Inflated home advantage will overrate teams with lots of
+                            # home friendlies/qualifiers in their recent history.
+  shootout_pseudo_score: 0.55   # treats a shootout win as a 0.55/0.45 result instead of
+                                 # a clean 1/0 — softens Elo swings from penalty shootouts.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 2 — Recency window & decay (fetch_data.R, Section 3)
+# ──────────────────────────────────────────────────────────────────────────
+recency:
+  cutoff_year: 2022        # matches before this are IGNORED for all "recent" features
+                            # (form, attack/defence, pagerank, qualifier stats).
+                            # Elo still uses full history regardless of this cutoff.
+  half_life_days: 730      # exponential time-decay half-life (~2 years) applied as
+                            # exp(-days_ago / half_life_days). Smaller = more weight on
+                            # very recent matches; larger = smoother/longer memory.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 3 — Competition weighting (fetch_data.R, Section 3)
+# ──────────────────────────────────────────────────────────────────────────
+# These multipliers decide how much a single match "counts" toward
+# weighted features (w_gf, w_ga, weighted_pts, etc).
+# ⚠ A qualifier vs. a weak regional opponent gets the SAME 1.5x weight as
+#   a World Cup match vs. a top team. This is part of the bias: regional
+#   qualifiers (where Japan/Iran/Morocco accumulate lots of weighted wins)
+#   are treated as equally informative as actual World Cup matches.
+competition_weights:
+  world_cup_or_wc_qualifier: 1.5
+  major_continental_or_nations_league: 1.2   # Euro, Copa America, AFCON, Asian Cup,
+                                              # Nations League, Gold Cup, Confederations
+  friendly: 0.6
+  other_default: 0.9
+  # SUGGESTED FIX: split "World Cup qualifier" out from "World Cup" itself,
+  # and weight actual World Cup finals matches higher (e.g. 2.0) than
+  # qualifiers (e.g. 1.1), since qualifiers are often against weaker/closer
+  # regional opposition and are not equally predictive of finals performance.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 4 — Feature rescaling scope (fetch_data.R, Section 5)
+# ──────────────────────────────────────────────────────────────────────────
+rescaling:
+  global_rescale: true    # ⚠ CURRENTLY FALSE in the script. If true, rescale
+                            # elo_sc/attack_str/defence_str/form_sc/pr_sc/q_sc against
+                            # ALL teams with data (not just the 48 WC finalists) before
+                            # computing team_strength. This is the single biggest lever
+                            # to fix "weak-region team looks elite" inflation.
+  shrinkage_tau: 5          # empirical-Bayes shrinkage strength for w_gf/w_ga toward the
+                             # global mean. HIGHER tau = teams with few matches get pulled
+                             # harder toward the average (safer for low-data teams, but
+                             # also dilutes genuinely strong small-sample teams).
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 5 — Composite team_strength weights (fetch_data.R, Sections 5 & 6)
+# ──────────────────────────────────────────────────────────────────────────
+# Two versions exist depending on whether player data was merged.
+# These MUST sum to 1.0 in each block.
+team_strength_weights:
+  without_player_data:
+    elo: 0.35              # Elo: global history, hardest to inflate via weak schedule.
+    attack: 0.20           # weighted goals-for (shrunk) — relative to the 48-team pool.
+    defence: 0.15          # weighted goals-against (shrunk, inverted).
+    form_last5: 0.15       # average points over last 5 matches.
+    pagerank: 0.10         # WC-vs-WC win-graph PageRank — regional-bias prone (see above).
+    qualifier: 0.05        # average points-per-qualifier-match.
+  with_player_data:
+    elo: 0.30
+    attack: 0.15
+    defence: 0.15
+    form_last5: 0.10
+    pagerank: 0.10
+    qualifier: 0.05
+    player_attack: 0.10    # goals_p90 + xg_p90 of players from Big-5-league dataset.
+                            # ⚠ Coverage is uneven: a team with several Big-5-league
+                            # players will score higher here than one whose squad plays
+                            # domestically, REGARDLESS of national-team quality. Check
+                            # player_nation_coverage.csv before trusting this term for a
+                            # given team — has_player_data=FALSE teams get a filled-in
+                            # median value rather than a real penalty.
+    player_defence: 0.05   # tackles_p90 + interceptions_p90, same caveat as above.
+  # RECOMMENDATION: bump `elo` to 0.45-0.50 and `pagerank` down to 0.0-0.05 until you
+  # implement global_rescale — Elo is the only feature here that's anchored to the
+  # full international pool rather than just the 48 finalists.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 6 — Bradley-Terry proxy (simulate.R, Block 3A)
+# ──────────────────────────────────────────────────────────────────────────
+bradley_terry:
+  proxy_scale: 3           # bt_ability_proxy = team_strength * scale - offset.
+  proxy_offset: 1.5         # used ONLY for teams the BT model couldn't fit directly
+                            # (i.e. it just re-derives ability from team_strength,
+                            # so it inherits the same regional-strength bias).
+  proxy_se: 0.35            # standard error assigned to proxy-only teams.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 7 — Poisson / Dixon-Coles fallback (simulate.R, Block 3B)
+# ──────────────────────────────────────────────────────────────────────────
+poisson_model:
+  min_matches_for_glmer: 30      # below this row count, falls back to the
+                                  # team_strength-based lambda formula entirely.
+  fallback_lambda_base: 1.0       # baseline expected goals when falling back.
+  fallback_strength_multiplier: 1.6  # lambda = base + (team_strength - 0.5) * multiplier.
+                                       # Higher = strength differences produce bigger
+                                       # goal-expectancy gaps (more blowouts simulated).
+  player_log_adjustment_weight: 0.35  # how much player_attack_sc/player_defence_sc shift
+                                        # goal expectancy on the log scale. ±0.35 at the
+                                        # extremes (~±42% on lambda).
+  min_lambda_floor: 0.3            # floor so no team is ever simulated as a near-zero
+                                     # scoring threat.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 8 — Ensemble & knockout adjustments (simulate.R, Block 3B end)
+# ──────────────────────────────────────────────────────────────────────────
+ensemble:
+  bt_weight: 0.5            # final P(A beats B) = bt_weight * BT_prob + (1-bt_weight) * Poisson-derived prob
+  poisson_weight: 0.5
+  knockout_extra_time_compression: 0.8
+    # In simulate_knockout(), win probabilities are compressed toward 50/50:
+    #   p_compressed = 0.5 + (p - 0.5) * 0.6
+    # i.e. a 70% favourite becomes a 62% favourite in knockout rounds (models
+    # extra-time/penalty randomness). Raise toward 1.0 to let the better team's
+    # edge carry through more strongly in knockouts; lower it for more "anyone
+    # can win a one-off game" randomness.
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 9 — Group-stage simulation (simulate.R, Block 4)
+# ──────────────────────────────────────────────────────────────────────────
+group_stage:
+  neutral_venue_assumption: true
+    # ⚠ simulate_group() calls score_win_prob() / predict_goals() WITHOUT ever
+    # passing neutral=FALSE, so home advantage is NEVER applied during the group
+    # stage even though host nations (USA/Mexico/Canada/Qatar-as-defending-host-
+    # confederation, etc.) will play actual home/near-home matches. This slightly
+    # underrates host and co-host nations.
+  third_place_qualifiers: 8     # number of best 3rd-placed teams advancing (32-team KO bracket).
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 10 — Monte Carlo
+# ──────────────────────────────────────────────────────────────────────────
+monte_carlo:
+  n_simulations: 10000
+  random_seed: 2026
+
+# ──────────────────────────────────────────────────────────────────────────
+# SECTION 11 — Data source weighting flags (fetch_data.R, Section 7)
+# ──────────────────────────────────────────────────────────────────────────
+data_quality_thresholds:
+  min_matches_for_full_flag: 5
+    # Teams need >=5 recent (post-cutoff_year) matches AND player data to be
+    # flagged "full". Below that they're "team_only"/"player_only"/"proxy_only".
+    # Teams flagged proxy_only effectively get team_strength = elo_sc only,
+    # which is actually the SAFEST score in this pipeline (see root cause note).
+
+################################################################################
+# QUICK EXPERIMENTS TO TRY, IN ORDER OF EXPECTED IMPACT
+# 1. Set rescaling.global_rescale = true (requires a small code change in
+#    fetch_data.R Section 5: rescale elo_current/w_gf/w_ga/form_last5/pagerank
+#    against the full `matches`/`long`-equivalent built from ALL teams in
+#    results.csv, not just WC_TEAMS, before subsetting to the 48 finalists).
+# 2. Raise team_strength_weights.*.elo to 0.45-0.50, drop pagerank to ~0.05.
+# 3. Split competition_weights so "World Cup qualifier" < "World Cup" finals.
+# 4. Increase shrinkage_tau (e.g. 8-10) to pull thin-sample teams further
+#    toward the global mean attack/defence rates.
+################################################################################

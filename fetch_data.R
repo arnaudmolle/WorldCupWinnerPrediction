@@ -32,20 +32,45 @@
 ##  All downstream model/simulation code reads only the .rds files above.
 ################################################################################
 
-## ── USER SETTINGS ─────────────────────────────────────────────────────────────
-DATA_DIR   <- "data"          # folder containing the Kaggle CSVs
-OUT_DIR    <- "wc2026_output"
-CUTOFF_YR  <- 2022            # ignore matches before this year for features
-                              # (older data still used for Elo initialisation)
-ELO_K      <- 30              # Elo K-factor
-ELO_START  <- 1500            # initial Elo for every team
+## ── USER SETTINGS (overridable by config.yaml) ──────────────────────────────
+# Defaults; if a `config.yaml` exists in the repo root, its values will
+# override these. This lets users tune the pipeline without editing code.
+cfg <- list()
+if (file.exists("config.yaml")) {
+  if (!requireNamespace("yaml", quietly = TRUE))
+    install.packages("yaml", repos = "https://cloud.r-project.org")
+  cfg <- yaml::read_yaml("config.yaml")
+}
+
+DATA_DIR  <- if (!is.null(cfg$paths$data_dir)) cfg$paths$data_dir else "data"
+OUT_DIR   <- if (!is.null(cfg$paths$output_dir)) cfg$paths$output_dir else "wc2026_output"
+CUTOFF_YR <- if (!is.null(cfg$recency$cutoff_year)) cfg$recency$cutoff_year else 2022
+ELO_K     <- if (!is.null(cfg$elo$elo_k)) cfg$elo$elo_k else 30
+ELO_START <- if (!is.null(cfg$elo$elo_start)) cfg$elo$elo_start else 1500
+
+# Extra tunables used further down
+HOME_ADVANTAGE   <- if (!is.null(cfg$elo$home_advantage)) cfg$elo$home_advantage else 100
+half_life_days  <- if (!is.null(cfg$recency$half_life_days)) cfg$recency$half_life_days else 730
+shrinkage_tau    <- if (!is.null(cfg$rescaling$shrinkage_tau)) cfg$rescaling$shrinkage_tau else 5
+global_rescale   <- if (!is.null(cfg$rescaling$global_rescale)) cfg$rescaling$global_rescale else TRUE
+
+## Competition weights (fallbacks match previous behaviour)
+comp_w_wc_finals   <- if (!is.null(cfg$competition_weights$world_cup_finals)) cfg$competition_weights$world_cup_finals else 2.0
+comp_w_wc_qualifier<- if (!is.null(cfg$competition_weights$world_cup_qualifier)) cfg$competition_weights$world_cup_qualifier else 1.1
+comp_w_major<- if (!is.null(cfg$competition_weights$major_continental_or_nations_league)) cfg$competition_weights$major_continental_or_nations_league else 1.2
+comp_w_frd  <- if (!is.null(cfg$competition_weights$friendly)) cfg$competition_weights$friendly else 0.6
+comp_w_def  <- if (!is.null(cfg$competition_weights$other_default)) cfg$competition_weights$other_default else 0.9
+
+# Team-strength weights (use with_player_data if available)
+weights_no_players  <- if (!is.null(cfg$team_strength_weights$without_player_data)) cfg$team_strength_weights$without_player_data else list(elo=0.35, attack=0.20, defence=0.15, form_last5=0.15, pagerank=0.10, qualifier=0.05)
+weights_with_players<- if (!is.null(cfg$team_strength_weights$with_player_data)) cfg$team_strength_weights$with_player_data else list(elo=0.30, attack=0.15, defence=0.15, form_last5=0.10, pagerank=0.10, qualifier=0.05, player_attack=0.10, player_defence=0.05)
 
 dir.create(OUT_DIR,  showWarnings = FALSE)
 dir.create(DATA_DIR, showWarnings = FALSE)
 
 ## ── PACKAGES ──────────────────────────────────────────────────────────────────
 pkgs <- c("dplyr","tidyr","purrr","stringr","readr","tibble","lubridate",
-          "scales","janitor")
+          "scales","janitor","yaml")
 new  <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
 if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
 invisible(lapply(pkgs, library, character.only = TRUE))
@@ -310,7 +335,8 @@ if (!is.null(raw_results) && ok_results) {
 
   ## ── Elo calculation (full history) ───────────────────────────────────────
   ## Uses all matches chronologically; neutral-venue matches have no home boost.
-  HOME_ADVANTAGE <- 100   # Elo points added to home team when not neutral
+  ## HOME_ADVANTAGE comes from config (or default above)
+  HOME_ADVANTAGE <- HOME_ADVANTAGE
 
   elo_ratings <- tibble::tibble(
     team = unique(c(matches$home_team, matches$away_team)),
@@ -354,15 +380,17 @@ if (!is.null(raw_results) && ok_results) {
   recent <- recent |>
     dplyr::mutate(
       days_ago    = as.numeric(Sys.Date() - date),
-      time_weight = exp(-days_ago / 730),   # ~2 yr half-life
+      time_weight = exp(-days_ago / half_life_days),
       comp_weight = dplyr::case_when(
+        ## World Cup qualifiers should be weighted differently from finals
+        stringr::str_detect(competition, "(?i)qualifier") ~ comp_w_wc_qualifier,
+        ## If it's a World Cup match but not a qualifier, treat as finals
+        stringr::str_detect(competition, "(?i)World Cup") & !stringr::str_detect(competition, "(?i)qualifier") ~ comp_w_wc_finals,
         stringr::str_detect(competition,
-          "(?i)FIFA World Cup|World Cup qualifier|WC qualifier|World Cup") ~ 1.5,
-        stringr::str_detect(competition,
-          "(?i)UEFA Euro|Copa America|Africa Cup|Asian Cup|CONCACAF|Nations League|
-           Gold Cup|AFCON|Confederations") ~ 1.2,
-        stringr::str_detect(competition, "(?i)friendly") ~ 0.6,
-        TRUE ~ 0.9
+          "(?i)UEFA Euro|Copa America|Africa Cup|Asian Cup|CONCACAF|Nations League|\
+           Gold Cup|AFCON|Confederations") ~ comp_w_major,
+        stringr::str_detect(competition, "(?i)friendly") ~ comp_w_frd,
+        TRUE ~ comp_w_def
       ),
       match_weight = time_weight * comp_weight
     )
@@ -434,8 +462,11 @@ has_results <- nrow(recent) >= 10
 
 if (has_results) {
 
-  ## Long format: one row per team per match
-  long <- dplyr::bind_rows(
+  ## Long format: one row per team per match. Build both a global view
+  ## (long_all) and a WC-only view (long). The global view is used when
+  ## `global_rescale` is enabled in config.yaml so rescaling uses all
+  ## teams in results.csv rather than just the 48 finalists.
+  long_all <- dplyr::bind_rows(
     recent |> dplyr::transmute(
       date, match_weight, competition,
       team = home_team, opponent = away_team,
@@ -445,13 +476,15 @@ if (has_results) {
       team = away_team, opponent = home_team,
       gf = away_goals, ga = home_goals, neutral)
   ) |>
-    dplyr::filter(team %in% WC_TEAMS) |>
     dplyr::mutate(
       result    = dplyr::case_when(gf > ga ~ "W", gf < ga ~ "L", TRUE ~ "D"),
       points    = dplyr::case_when(result == "W" ~ 3L,
                                     result == "D" ~ 1L, TRUE ~ 0L),
       goal_diff = gf - ga
     )
+
+  ## WC-only view used for the 48 finalists
+  long <- long_all |> dplyr::filter(team %in% WC_TEAMS)
 
   ## Pre-compute form_last5 BEFORE the main summarise to avoid
   ## dplyr::cur_data() which is deprecated and causes vctrs size errors
@@ -463,7 +496,15 @@ if (has_results) {
     dplyr::slice_tail(n = 5) |>
     dplyr::summarise(form_last5 = mean(points), .groups = "drop")
 
-  ## Core weighted aggregates
+  if (global_rescale) {
+    form_last5_df_all <- long_all |>
+      dplyr::arrange(date) |>
+      dplyr::group_by(team) |>
+      dplyr::slice_tail(n = 5) |>
+      dplyr::summarise(form_last5 = mean(points), .groups = "drop")
+  }
+
+  ## Core weighted aggregates (WC-only)
   tf_core <- long |>
     dplyr::group_by(team) |>
     dplyr::summarise(
@@ -478,6 +519,22 @@ if (has_results) {
       .groups      = "drop"
     ) |>
     dplyr::left_join(form_last5_df, by = "team")
+
+  if (global_rescale) {
+    tf_core_all <- long_all |>
+      dplyr::group_by(team) |>
+      dplyr::summarise(
+        n_matches    = n(),
+        weighted_pts = sum(match_weight * points),
+        w_gf         = sum(match_weight * gf) / sum(match_weight),
+        w_ga         = sum(match_weight * ga) / sum(match_weight),
+        w_gd         = w_gf - w_ga,
+        win_rate     = mean(result == "W"),
+        draw_rate    = mean(result == "D"),
+        cs_rate      = mean(ga == 0),
+        .groups      = "drop"
+      )
+  }
 
   ## Qualifier-specific stats
   tf_qual <- long |>
@@ -552,22 +609,55 @@ if (has_results) {
     )
 
   ## Normalised composite strength (0 → 1)
+  ## Apply mild empirical-Bayes shrinkage to goals-per-game estimates
+  ## to reduce over-weighting of extremes from small or unbalanced samples.
+  if (global_rescale && exists("tf_core_all")) {
+    global_w_gf <- mean(tf_core_all$w_gf, na.rm = TRUE)
+    global_w_ga <- mean(tf_core_all$w_ga, na.rm = TRUE)
+  } else {
+    global_w_gf <- mean(team_features$w_gf, na.rm = TRUE)
+    global_w_ga <- mean(team_features$w_ga, na.rm = TRUE)
+  }
+  tau <- shrinkage_tau   # shrinkage strength (tunable)
+
+  ## If global rescale requested, precompute ranges for rescaling after
+  ## empirical Bayes shrinkage so we rescale against the global distribution.
+  if (global_rescale && exists("tf_core_all")) {
+    shr_w_gf_all <- (tf_core_all$w_gf * tf_core_all$n_matches + global_w_gf * tau) / (tf_core_all$n_matches + tau)
+    shr_w_ga_all <- (tf_core_all$w_ga * tf_core_all$n_matches + global_w_ga * tau) / (tf_core_all$n_matches + tau)
+    form_last5_range_all <- if (exists("form_last5_df_all")) range(form_last5_df_all$form_last5, na.rm = TRUE) else c(0,1)
+    elo_range_all <- range(elo_ratings$elo, na.rm = TRUE)
+  }
+
   team_features <- team_features |>
     dplyr::mutate(
-      elo_sc      = scales::rescale(elo_current, to = c(0, 1)),
-      attack_str  = scales::rescale(w_gf,        to = c(0, 1)),
-      defence_str = scales::rescale(-w_ga,        to = c(0, 1)),
-      form_sc     = scales::rescale(form_last5,   to = c(0, 1)),
-      pr_sc       = scales::rescale(pagerank,     to = c(0, 1)),
-      q_sc        = scales::rescale(q_pts_per,    to = c(0, 1)),
+      shr_w_gf = (w_gf * n_matches + global_w_gf * tau) / (n_matches + tau),
+      shr_w_ga = (w_ga * n_matches + global_w_ga * tau) / (n_matches + tau)
+    ) |>
+    dplyr::mutate(
+      elo_sc = if (global_rescale && exists("elo_range_all"))
+                 scales::rescale(elo_current, to = c(0,1), from = elo_range_all)
+               else scales::rescale(elo_current, to = c(0,1)),
+      attack_str = if (global_rescale && exists("shr_w_gf_all"))
+                     scales::rescale(shr_w_gf, to = c(0,1), from = range(shr_w_gf_all, na.rm = TRUE))
+                   else scales::rescale(shr_w_gf, to = c(0,1)),
+      defence_str = if (global_rescale && exists("shr_w_ga_all"))
+                      scales::rescale(-shr_w_ga, to = c(0,1), from = range(-shr_w_ga_all, na.rm = TRUE))
+                    else scales::rescale(-shr_w_ga, to = c(0,1)),
+      form_sc = if (global_rescale && exists("form_last5_range_all"))
+                  scales::rescale(form_last5, to = c(0,1), from = form_last5_range_all)
+                else scales::rescale(form_last5, to = c(0,1)),
+      pr_sc = scales::rescale(pagerank, to = c(0,1)),
+      q_sc  = scales::rescale(q_pts_per, to = c(0,1)),
       ## Weighted composite (tunable weights)
-      team_strength = 0.35 * elo_sc    +
-                      0.20 * attack_str +
-                      0.15 * defence_str+
-                      0.15 * form_sc   +
-                      0.10 * pr_sc     +
-                      0.05 * q_sc
-    )
+      team_strength = as.numeric(weights_no_players$elo) * elo_sc    +
+              as.numeric(weights_no_players$attack) * attack_str +
+              as.numeric(weights_no_players$defence) * defence_str +
+              as.numeric(weights_no_players$form_last5) * form_sc   +
+              as.numeric(weights_no_players$pagerank) * pr_sc     +
+              as.numeric(weights_no_players$qualifier) * q_sc
+    ) |>
+    dplyr::select(-shr_w_gf, -shr_w_ga)
 
   cat("  Team features built from match data.\n")
   cat("  Teams with ≥5 recent matches:",
@@ -740,15 +830,15 @@ if (!is.null(raw_players) && ok_players) {
       player_defence_sc = scales::rescale(
         tidyr::replace_na(tackles_p90, 0) + tidyr::replace_na(interceptions_p90, 0),
         to = c(0, 1)),
-      ## Update composite team_strength to include player quality
-      team_strength = 0.30 * elo_sc        +
-                      0.15 * attack_str    +
-                      0.15 * defence_str   +
-                      0.10 * form_sc       +
-                      0.10 * pr_sc         +
-                      0.05 * q_sc          +
-                      0.10 * player_attack_sc  +
-                      0.05 * player_defence_sc
+      ## Update composite team_strength to include player quality (use config weights)
+      team_strength = as.numeric(weights_with_players$elo) * elo_sc +
+              as.numeric(weights_with_players$attack) * attack_str +
+              as.numeric(weights_with_players$defence) * defence_str +
+              as.numeric(weights_with_players$form_last5) * form_sc +
+              as.numeric(weights_with_players$pagerank) * pr_sc +
+              as.numeric(weights_with_players$qualifier) * q_sc +
+              as.numeric(weights_with_players$player_attack) * player_attack_sc +
+              as.numeric(weights_with_players$player_defence) * player_defence_sc
     )
 
   feature_source <- "match_data + Elo + PageRank + player_stats"

@@ -141,6 +141,19 @@ force_refresh <- FALSE       # TRUE = ignore .rds caches, re-read CSVs
 n_sim         <- 10000L      # Monte Carlo simulation runs
 ```
 
+## Configuration via `config.yaml`
+
+You can tune most pipeline choices via `config.yaml` at the repo root.
+Copy the example `config.yaml` (provided) and change values such as:
+
+- rescaling.global_rescale: true  — rescale features against the global
+  international pool instead of only the 48 finalists (recommended experiment)
+- monte_carlo.n_simulations: 10000
+- ensemble.bt_weight / poisson_weight — blend between Bradley-Terry and Poisson
+- ensemble.knockout_extra_time_compression — reduce favourite edge in KO
+
+The pipeline will read `config.yaml` automatically when you run the scripts.
+
 ---
 
 ## Outputs
@@ -168,6 +181,9 @@ All files are written to `wc2026_output/`.
 | `team_strength_map.png` | World choropleth coloured by team strength |
 | `strength_radar.png` | Spider charts for top-8 teams |
 | `h2h_network.png` | Directed head-to-head network graph |
+| `bracket_tree.png` | Deterministic most-likely tournament tree (who wins each match) |
+| `bracket_group_matches.csv` | Group-stage most-likely match results |
+| `bracket_knockout.csv` | Knockout-stage most-likely match results |
 
 ---
 

@@ -50,7 +50,23 @@ if (length(new_pkgs) > 0) {
 invisible(lapply(required_pkgs, library, character.only = TRUE))
 options(dplyr.summarise.inform = FALSE)
 
-n_sim <- 10000L   # Monte Carlo runs
+n_sim <- 10000L   # Monte Carlo runs (default)
+
+# Read config.yaml if present to override defaults (mirrors fetch_data.R)
+cfg <- list()
+if (file.exists("config.yaml")) {
+  if (!requireNamespace("yaml", quietly = TRUE))
+    install.packages("yaml", repos = "https://cloud.r-project.org")
+  cfg <- yaml::read_yaml("config.yaml")
+}
+
+if (!is.null(cfg$monte_carlo$random_seed)) set.seed(cfg$monte_carlo$random_seed)
+if (!is.null(cfg$monte_carlo$n_simulations)) n_sim <- as.integer(cfg$monte_carlo$n_simulations)
+
+# Ensemble and knockout tuning
+bt_w <- if (!is.null(cfg$ensemble$bt_weight)) cfg$ensemble$bt_weight else 0.5
+poisson_w <- if (!is.null(cfg$ensemble$poisson_weight)) cfg$ensemble$poisson_weight else 0.5
+ko_compression <- if (!is.null(cfg$ensemble$knockout_extra_time_compression)) cfg$ensemble$knockout_extra_time_compression else 0.6
 
 ## ── CANONICAL MAP  (identical to fetch_data.R) ────────────────────────────────
 CANONICAL_MAP <- c(
@@ -458,8 +474,9 @@ ensemble_win_prob <- function(ta, tb, extra_time = FALSE) {
   dc    <- score_win_prob(ta, tb)
   denom <- unname(dc["win_a"]) + unname(dc["win_b"])
   dc_p  <- if (denom > 0) unname(dc["win_a"]) / denom else bt_p
-  pa    <- 0.5 * bt_p + 0.5 * dc_p
-  if (extra_time) pa <- 0.5 + (pa - 0.5) * 0.6
+  weight_sum <- bt_w + poisson_w
+  pa    <- (bt_w * bt_p + poisson_w * dc_p) / max(1e-12, weight_sum)
+  if (extra_time) pa <- 0.5 + (pa - 0.5) * ko_compression
   c(p_a = as.numeric(pa), p_b = as.numeric(1 - pa))
 }
 
@@ -529,7 +546,8 @@ simulate_tournament <- function() {
   bracket
 }
 
-set.seed(2026)
+w_seed <- if (!is.null(cfg$monte_carlo$random_seed)) as.integer(cfg$monte_carlo$random_seed) else NULL
+if (!is.null(w_seed)) set.seed(w_seed)
 winners <- character(n_sim)
 progressr::with_progress({
   pg <- progressr::progressor(n_sim)
@@ -1132,7 +1150,7 @@ most_likely_knockout <- function(ta, tb, stage_label) {
     row = tibble::tibble(
       stage = stage_label, team_a = ta, team_b = tb,
       prob_a = round(unname(p["p_a"]), 3),
-      prob_b = round(unname(p["b_b"] %||% p["p_b"]), 3),
+      prob_b = round(unname(p["p_b"]), 3),
       winner = winner
     )
   )

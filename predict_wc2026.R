@@ -1135,7 +1135,7 @@ progressr::with_progress({
 win_probs <- table(winners[!is.na(winners)]) |>
   sort(decreasing = TRUE) |>
   as.data.frame() |>
-  dplyr::rename(team = winners, n_wins = Freq) |>
+  dplyr::rename(team = Var1, n_wins = Freq) |>
   dplyr::mutate(
     win_pct   = n_wins / sum(n_wins),
     win_pct_l = qbeta(0.025, n_wins + 1, n_sim - n_wins + 1),
