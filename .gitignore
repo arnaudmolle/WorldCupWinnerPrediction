@@ -1,0 +1,21 @@
+# R and project files
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+
+# Output caches and generated files
+wc2026_output/*.rds
+wc2026_output/*.png
+wc2026_output/*.csv
+wc2026_output/*.pdf
+
+# Data folders (if you store raw API dumps locally)
+data/cache/
+data/*.rds
+data/*.csv
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

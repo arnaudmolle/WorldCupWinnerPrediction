@@ -1,0 +1,26 @@
+Generated: 2026-06-14 22:35:16.003069
+Feature source: match_data + Elo + PageRank + player_stats
+
+WC teams total: 51
+Results CSV rows: 49477
+Recent matches (>=2022): 4570
+Teams with match data: 51
+Teams with player data: 47
+
+── Team features top 10 by strength ──
+# A tibble: 10 × 6
+   team     team_strength elo_current n_matches has_player_data data_source_flag
+   <chr>            <dbl>       <dbl>     <int> <lgl>           <chr>           
+ 1 Argenti…         0.716       2075.        55 TRUE            full            
+ 2 Japan            0.666       1891.        56 TRUE            full            
+ 3 Spain            0.630       2041.        54 TRUE            full            
+ 4 France           0.624       1983.        55 TRUE            full            
+ 5 Morocco          0.602       1884.        71 TRUE            full            
+ 6 Portugal         0.600       1953.        54 TRUE            full            
+ 7 England          0.599       1922.        54 TRUE            full            
+ 8 Côte d'…         0.597       1765.        56 TRUE            full            
+ 9 Belgium          0.587       1884.        50 TRUE            full            
+10 Norway           0.566       1816.        44 TRUE            full            
+
+── Teams missing match data ──
+
