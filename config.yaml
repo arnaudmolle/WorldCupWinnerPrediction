@@ -44,9 +44,9 @@ paths:
 # ──────────────────────────────────────────────────────────────────────────
 elo:
   elo_start: 1500          # initial rating for every team (incl. teams with no history)
-  elo_k: 30                # K-factor: higher = ratings swing faster on a single result.
+  elo_k: 25                # K-factor: higher = ratings swing faster on a single result.
                             # 20-30 is standard for international football models.
-  home_advantage: 100      # Elo points added to the home side when match isn't neutral.
+  home_advantage: 80      # Elo points added to the home side when match isn't neutral.
                             # Inflated home advantage will overrate teams with lots of
                             # home friendlies/qualifiers in their recent history.
   shootout_pseudo_score: 0.55   # treats a shootout win as a 0.55/0.45 result instead of
@@ -59,7 +59,7 @@ recency:
   cutoff_year: 2022        # matches before this are IGNORED for all "recent" features
                             # (form, attack/defence, pagerank, qualifier stats).
                             # Elo still uses full history regardless of this cutoff.
-  half_life_days: 730      # exponential time-decay half-life (~2 years) applied as
+  half_life_days: 545      # exponential time-decay half-life (~2 years) applied as
                             # exp(-days_ago / half_life_days). Smaller = more weight on
                             # very recent matches; larger = smoother/longer memory.
 
@@ -76,7 +76,7 @@ competition_weights:
   world_cup_or_wc_qualifier: 1.5
   major_continental_or_nations_league: 1.2   # Euro, Copa America, AFCON, Asian Cup,
                                               # Nations League, Gold Cup, Confederations
-  friendly: 0.6
+  friendly: 0.45
   other_default: 0.9
   # SUGGESTED FIX: split "World Cup qualifier" out from "World Cup" itself,
   # and weight actual World Cup finals matches higher (e.g. 2.0) than
@@ -92,7 +92,7 @@ rescaling:
                             # ALL teams with data (not just the 48 WC finalists) before
                             # computing team_strength. This is the single biggest lever
                             # to fix "weak-region team looks elite" inflation.
-  shrinkage_tau: 5          # empirical-Bayes shrinkage strength for w_gf/w_ga toward the
+  shrinkage_tau: 10          # empirical-Bayes shrinkage strength for w_gf/w_ga toward the
                              # global mean. HIGHER tau = teams with few matches get pulled
                              # harder toward the average (safer for low-data teams, but
                              # also dilutes genuinely strong small-sample teams).

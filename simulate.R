@@ -40,6 +40,8 @@ required_pkgs <- c(
   "ggplot2","scales","glue","progressr",
   "BradleyTerry2","lme4",
   "rnaturalearth","sf",
+  "countrycode",
+  "rvest","xml2",
   "fmsb","RColorBrewer","viridis","janitor"
 )
 new_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
@@ -733,27 +735,26 @@ world_sf <- tryCatch(
 )
 
 if (!is.null(world_sf)) {
-  ## ISO3 table for all 48 WC teams
-  country_iso <- tibble::tibble(
-    team   = canon(c(
-      "France","Spain","England","Germany","Brazil","Argentina","Portugal",
-      "Netherlands","Belgium","Morocco","Japan","South Korea","Colombia",
-      "Switzerland","Uruguay","Croatia","Austria","United States","Mexico",
-      "Canada","Denmark","Iran","Saudi Arabia","Egypt","Senegal","Ghana",
-      "Algeria","Cabo Verde","South Africa","Tunisia","Côte d'Ivoire",
-      "Norway","Sweden","Ecuador","Paraguay","Australia",
-      "Bosnia and Herzegovina","Czechia","Panama","Türkiye","Jordan",
-      "Uzbekistan","Iraq","Qatar","Congo DR","Curaçao","Scotland",
-      "Haiti","Serbia","New Zealand"
-    )),
-    iso_a3 = c(
-      "FRA","ESP","GBR","DEU","BRA","ARG","PRT","NLD","BEL","MAR","JPN",
-      "KOR","COL","CHE","URY","HRV","AUT","USA","MEX","CAN","DNK","IRN",
-      "SAU","EGY","SEN","GHA","DZA","CPV","ZAF","TUN","CIV","NOR","SWE",
-      "ECU","PRY","AUS","BIH","CZE","PAN","TUR","JOR","UZB","IRQ","QAT",
-      "COD","CUW","GBR","HTI","SRB","NZL"
-    )
+  ## ISO3 mapping: derive iso3 codes from team names using `countrycode`
+  teams_for_map <- sort(unique(team_features$team))
+  iso3 <- countrycode::countrycode(teams_for_map, origin = 'country.name', destination = 'iso3c', warn = FALSE)
+  ## Manual fixes for names countrycode may not map cleanly
+  manual_iso <- c(
+    "Côte d'Ivoire" = "CIV",
+    "Curaçao" = "CUW",
+    "Cabo Verde" = "CPV",
+    "South Korea" = "KOR",
+    "United States" = "USA",
+    "Türkiye" = "TUR",
+    "Congo DR" = "COD",
+    "Scotland" = "GBR",
+    "New Zealand" = "NZL",
+    "Saudi Arabia" = "SAU"
   )
+  for (n in names(manual_iso)) {
+    iso3[teams_for_map == n] <- manual_iso[[n]]
+  }
+  country_iso <- tibble::tibble(team = teams_for_map, iso_a3 = iso3)
 
   map_sf <- world_sf |>
     dplyr::left_join(
@@ -1133,13 +1134,101 @@ thirds <- group_standings |>
   dplyr::arrange(dplyr::desc(pts), dplyr::desc(gd), dplyr::desc(gf)) |>
   dplyr::slice_head(n = 8)
 
-## NOTE: this uses the SAME naive seeding as Block 4 (top2 + best-8-thirds,
-## concatenated in group order). It does NOT yet implement FIFA's official
-## cross-bracket seeding rules (which avoid same-group/confederation
-## rematches in the Round of 32). Swap in your real seeding table here if
-## you need bracket-accurate pairings rather than a strength-only path.
-bracket32 <- c(top2$team, thirds$team)
-stopifnot(length(bracket32) == 32)
+## Attempt to use FIFA's official Round-of-32 Annex C mapping (495 combos).
+## If available online (Wikipedia/FIFA), parse the combinations table and
+## deterministically place the 8 best third-placed teams into their
+## Round-of-32 slots. If parsing fails, fall back to the legacy greedy
+## swap approach used previously.
+team_to_group <- unlist(lapply(names(WC_GROUPS), function(g) setNames(rep(g, length(WC_GROUPS[[g]])), WC_GROUPS[[g]])))
+
+apply_fifa_r32_mapping <- function(top2_vec, thirds_vec) {
+  # top2_vec: 24 teams (ordered by group + rank)
+  # thirds_vec: 8 teams (ordered best-third ranking)
+  # returns a 32-vector bracket if successful, otherwise NULL
+  key_groups <- sort(unique(unname(team_to_group[thirds_vec])))
+  if (length(key_groups) != 8) return(NULL)
+  key <- paste(key_groups, collapse = ",")
+
+  # Try to fetch & parse the Wikipedia table for Annex C
+  url <- "https://en.wikipedia.org/wiki/2026_FIFA_World_Cup_knockout_stage"
+  ok <- tryCatch({
+    page <- xml2::read_html(url)
+    tbls <- rvest::html_nodes(page, "table")
+    dfs <- lapply(tbls, function(x) tryCatch(rvest::html_table(x, fill = TRUE), error = function(e) NULL))
+    dfs <- Filter(function(x) is.data.frame(x) && ncol(x) >= 10, dfs)
+    rows <- do.call(rbind, lapply(dfs, as.data.frame))
+    rows <- as.data.frame(rows, stringsAsFactors = FALSE)
+    if (nrow(rows) < 10) stop("no table rows")
+
+    # For each row, extract group letters (A-L) appearing as single letters
+    # and the mapping tokens like '3E', '3J', etc. We build a lookup from
+    # sorted-present-groups -> mapping vector (8 letters)
+    mapping_list <- list()
+    for (i in seq_len(nrow(rows))) {
+      r <- unlist(rows[i, ])
+      # tokens like '3E' or '3A' indicate mapping; single letters A-L indicate presence
+      tokens <- unlist(strsplit(paste(r, collapse = " "), "\\s+"))
+      tokens <- tokens[tokens != "" & !is.na(tokens)]
+      pres <- unique(grep("^[A-L]$", tokens, value = TRUE))
+      maps <- unique(grep("^3[A-L]$", tokens, value = TRUE))
+      if (length(pres) == 8 && length(maps) == 8) {
+        k <- paste(sort(pres), collapse = ",")
+        # strip leading '3' -> keep letter order as found in maps
+        mapping_list[[k]] <- substring(maps, 2)
+      }
+    }
+
+    if (length(mapping_list) == 0) stop("no mapping rows parsed")
+
+    # lookup for our key
+    if (!key %in% names(mapping_list)) return(NULL)
+    slot_groups <- mapping_list[[key]]
+    # slot_groups is an 8-char vector like c('E','J','I',...)
+    # Now place thirds_vec into bracket slots in the same order as slot_groups
+    # Identify which R32 matches accept best-3rd teams and their slot indices
+    # We reuse the existing bracket ordering convention: top2 (24) in group order
+    # followed by 8 third slots — we will replace those 8 positions according
+    # to slot_groups ordering.
+    br <- c(as.character(top2_vec), rep(NA_character_, 8))
+    # Build mapping from group letter -> team name for thirds_vec
+    grp_to_team <- setNames(thirds_vec, unname(team_to_group[thirds_vec]))
+    # Fill br[25:32] in the order of slot_groups
+    for (j in seq_along(slot_groups)) {
+      g <- slot_groups[j]
+      br[24 + j] <- grp_to_team[[g]]
+    }
+    if (any(is.na(br))) return(NULL)
+    br
+  }, error = function(e) {
+    NULL
+  })
+  ok
+}
+
+# Try authoritative mapping first, else fall back to greedy swap
+bracket32 <- apply_fifa_r32_mapping(top2$team, thirds) 
+if (is.null(bracket32)) {
+  # Fallback: original naive concatenation with greedy swaps to avoid same-group
+  bracket32 <- c(top2$team, thirds)
+  stopifnot(length(bracket32) == 32)
+  fix_round32_pairs <- function(br) {
+    br <- as.character(br)
+    for (i in seq(1, length(br), by = 2)) {
+      a <- br[i]; b <- br[i+1]
+      if (!is.null(team_to_group[a]) && !is.null(team_to_group[b]) && team_to_group[a] == team_to_group[b]) {
+        swap_idx <- NA
+        for (j in seq(i+2, length(br))) {
+          if (team_to_group[br[j]] != team_to_group[a]) { swap_idx <- j; break }
+        }
+        if (!is.na(swap_idx)) {
+          tmp <- br[swap_idx]; br[swap_idx] <- br[i+1]; br[i+1] <- tmp
+        }
+      }
+    }
+    br
+  }
+  bracket32 <- fix_round32_pairs(bracket32)
+}
 
 ## ---- Knockout rounds: always advance the higher win-probability team ----
 most_likely_knockout <- function(ta, tb, stage_label) {
@@ -1222,11 +1311,11 @@ seg_df <- plot_df |>
 p_bracket <- ggplot2::ggplot() +
   ggplot2::geom_segment(
     data = plot_df, ggplot2::aes(x = x, xend = x + 0.9, y = y_top, yend = y_top),
-    colour = "grey60"
+    colour = "grey70", linewidth = 0.4
   ) +
   ggplot2::geom_segment(
     data = plot_df, ggplot2::aes(x = x, xend = x + 0.9, y = y_bot, yend = y_bot),
-    colour = "grey60"
+    colour = "grey70", linewidth = 0.4
   ) +
   ggplot2::geom_text(
     data = plot_df,
@@ -1248,8 +1337,9 @@ p_bracket <- ggplot2::ggplot() +
     data = plot_df,
     ggplot2::aes(x = x + 0.45, y = (y_top + y_bot) / 2,
                  label = scales::percent(pmax(prob_a, 1 - prob_a), accuracy = 1)),
-    size = 2.4, colour = "grey45"
+    size = 2.2, colour = "grey45"
   ) +
+  ggplot2::geom_point(data = plot_df, ggplot2::aes(x = x + 0.9, y = (y_top + y_bot)/2, colour = winner), size = 1.8, show.legend = FALSE) +
   ggplot2::scale_colour_identity() +
   ggplot2::scale_x_continuous(
     breaks = seq_len(n_rounds), labels = round_names[seq_len(n_rounds)],
