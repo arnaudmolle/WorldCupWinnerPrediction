@@ -735,36 +735,77 @@ world_sf <- tryCatch(
 )
 
 if (!is.null(world_sf)) {
-  ## ISO3 mapping: derive iso3 codes from team names using `countrycode`
-  teams_for_map <- sort(unique(team_features$team))
-  iso3 <- countrycode::countrycode(teams_for_map, origin = 'country.name', destination = 'iso3c', warn = FALSE)
-  ## Manual fixes for names countrycode may not map cleanly
-  manual_iso <- c(
-    "Côte d'Ivoire" = "CIV",
-    "Curaçao" = "CUW",
-    "Cabo Verde" = "CPV",
-    "South Korea" = "KOR",
-    "United States" = "USA",
-    "Türkiye" = "TUR",
-    "Congo DR" = "COD",
-    "Scotland" = "GBR",
-    "New Zealand" = "NZL",
-    "Saudi Arabia" = "SAU"
-  )
-  for (n in names(manual_iso)) {
-    iso3[teams_for_map == n] <- manual_iso[[n]]
+
+  ## Use iso_a3_eh ("Eurostat-harmonised" code), NOT iso_a3 — rnaturalearth
+  ## deliberately sets iso_a3 = "-99" for France, Norway, and a handful of
+  ## other countries with overseas territories, which silently breaks any
+  ## join keyed on iso_a3. iso_a3_eh does not have this problem.
+  if (!"iso_a3_eh" %in% names(world_sf)) {
+    stop("world_sf missing iso_a3_eh column — update rnaturalearth/rnaturalearthdata")
   }
-  country_iso <- tibble::tibble(team = teams_for_map, iso_a3 = iso3)
+
+  ## Full, explicit ISO3 table for all 48 WC teams. No reliance on
+  ## countrycode() auto-resolution — every team is listed by hand so a
+  ## silent NA can't sneak in and fan-out-join onto unrelated countries.
+  ## NOTE: England & Scotland both map to GBR because Natural Earth has no
+  ## separate England/Scotland polygon — this is a genuine limitation of a
+  ## country-level choropleth, not a bug. Whichever of the two is processed
+  ## last in this table will "win" the UK polygon's colour.
+  wc_iso3 <- c(
+    "France" = "FRA", "Spain" = "ESP", "England" = "GBR", "Portugal" = "PRT",
+    "Germany" = "DEU", "Netherlands" = "NLD", "Belgium" = "BEL",
+    "Switzerland" = "CHE", "Croatia" = "HRV", "Austria" = "AUT",
+    "Serbia" = "SRB", "Denmark" = "DNK", "Ukraine" = "UKR", "Türkiye" = "TUR",
+    "Sweden" = "SWE", "Norway" = "NOR", "Bosnia and Herzegovina" = "BIH",
+    "Czechia" = "CZE",
+    "Brazil" = "BRA", "Argentina" = "ARG", "Colombia" = "COL",
+    "Uruguay" = "URY", "Ecuador" = "ECU", "Paraguay" = "PRY",
+    "Morocco" = "MAR", "Senegal" = "SEN", "Egypt" = "EGY",
+    "South Africa" = "ZAF", "Algeria" = "DZA", "Ghana" = "GHA",
+    "Cabo Verde" = "CPV", "Tunisia" = "TUN", "Côte d'Ivoire" = "CIV",
+    "Congo DR" = "COD",
+    "Japan" = "JPN", "South Korea" = "KOR", "Iran" = "IRN",
+    "Saudi Arabia" = "SAU", "Australia" = "AUS", "Jordan" = "JOR",
+    "Uzbekistan" = "UZB", "Iraq" = "IRQ", "Qatar" = "QAT",
+    "United States" = "USA", "Mexico" = "MEX", "Canada" = "CAN",
+    "Panama" = "PAN", "Scotland" = "GBR", "Haiti" = "HTI",
+    "Curaçao" = "CUW",
+    "New Zealand" = "NZL"   # placeholder per Group G note in fetch_data.R
+  )
+
+  teams_for_map <- sort(unique(group_teams_all))
+  unmapped <- setdiff(teams_for_map, names(wc_iso3))
+  if (length(unmapped) > 0) {
+    cat("  ⚠  Teams with NO iso3 mapping (will be excluded from map, not silently mis-joined):\n     ",
+        paste(unmapped, collapse = ", "), "\n")
+  }
+
+  country_iso <- tibble::tibble(
+    team   = names(wc_iso3),
+    iso_a3 = unname(wc_iso3)
+  ) |>
+    dplyr::filter(team %in% teams_for_map)   # only keep teams actually in our data
+
+  team_strength_iso <- country_iso |>
+    dplyr::left_join(team_features |> dplyr::filter(team %in% teams_for_map) |> dplyr::select(team, team_strength), by = "team") |>
+    dplyr::filter(!is.na(iso_a3))   # belt-and-suspenders: never join on NA keys
+
+  ## Sanity check: confirm every code actually exists in world_sf before plotting
+  missing_in_world <- setdiff(team_strength_iso$iso_a3, world_sf$iso_a3_eh)
+  if (length(missing_in_world) > 0) {
+    cat("  ⚠  iso3 codes not found in world_sf$iso_a3_eh:",
+        paste(missing_in_world, collapse = ", "), "\n")
+  }
 
   map_sf <- world_sf |>
-    dplyr::left_join(
-      country_iso |>
-        dplyr::left_join(
-          team_features |> dplyr::select(team, team_strength),
-          by = "team"
-        ),
-      by = "iso_a3"
-    )
+    dplyr::left_join(team_strength_iso, by = c("iso_a3_eh" = "iso_a3"))
+
+  ## Diagnostic: list which of the 48 teams actually got a fill, vs dropped
+  matched_teams <- sort(unique(map_sf$team[!is.na(map_sf$team_strength)]))
+  cat("  Map coverage:", length(matched_teams), "/", length(teams_for_map), "teams rendered\n")
+  dropped <- setdiff(teams_for_map, matched_teams)
+  if (length(dropped) > 0)
+    cat("  ⚠  Dropped from map (not rendered):", paste(dropped, collapse = ", "), "\n")
 
   p_map <- ggplot2::ggplot() +
     ggplot2::geom_sf(data = world_sf, fill = "grey92",
@@ -776,13 +817,17 @@ if (!is.null(world_sf)) {
     ) +
     ggplot2::scale_fill_viridis_c(
       option = "plasma", na.value = "grey92",
-      name = "Team\nStrength", limits = c(0, 1)
+      name = "Team\nStrength",
+      limits = c(
+        min(team_features$team_strength[team_features$team %in% teams_for_map], na.rm = TRUE),
+        max(team_features$team_strength[team_features$team %in% teams_for_map], na.rm = TRUE)
+      )
     ) +
     ggplot2::coord_sf(crs = sf::st_crs("ESRI:54030")) +
     ggplot2::labs(
       title    = "2026 FIFA World Cup – Team Strength by Country",
       subtitle = glue::glue(
-        "Elo + form + qualifier stats + player quality | ",
+        "{length(matched_teams)}/{length(teams_for_map)} WC teams rendered | ",
         "full data: {sum(team_features$data_source_flag == 'full', na.rm=TRUE)} teams"
       )
     ) +
@@ -1053,6 +1098,42 @@ if ("data_source_flag" %in% names(team_features)) {
                   width = 12, height = 14, dpi = 150)
   cat("  Saved: data_quality_probabilities.png\n")
 }
+## 7G  Team-strength contribution breakdown (stacked bar) ──────────────────
+contrib_path <- "wc2026_output/team_strength_contributions.csv"
+if (file.exists(contrib_path)) {
+  contrib <- readr::read_csv(contrib_path, show_col_types = FALSE)
+
+  top_n_contrib <- contrib |>
+    dplyr::arrange(dplyr::desc(team_strength)) |>
+    dplyr::slice_head(n = 15)
+
+  contrib_long <- top_n_contrib |>
+    dplyr::select(team, dplyr::starts_with("contrib_"), -contrib_check_sum) |>
+    tidyr::pivot_longer(-team, names_to = "component", values_to = "value") |>
+    dplyr::mutate(component = stringr::str_remove(component, "contrib_") |>
+                    stringr::str_replace_all("_", " ") |> stringr::str_to_title())
+
+  p_contrib <- ggplot2::ggplot(
+    contrib_long,
+    ggplot2::aes(x = reorder(team, value, FUN = sum), y = value, fill = component)
+  ) +
+    ggplot2::geom_col(width = 0.7) +
+    ggplot2::scale_fill_brewer(palette = "Set2", name = "Component") +
+    ggplot2::coord_flip() +
+    ggplot2::labs(
+      title    = "What's Actually Driving team_strength — Top 15 Teams",
+      subtitle = "Each bar segment is weight × component score. Use this to justify (or challenge) any team's rank.",
+      x = NULL, y = "Contribution to team_strength"
+    ) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+
+  ggplot2::ggsave("wc2026_output/team_strength_breakdown.png", p_contrib,
+                  width = 11, height = 8, dpi = 150)
+  cat("  Saved: team_strength_breakdown.png\n")
+} else {
+  cat("  ℹ  team_strength_contributions.csv not found — skipping breakdown plot\n")
+}
 ################################################################################
 ##  BLOCK 4B – Deterministic "most likely path" bracket
 ##
@@ -1206,10 +1287,10 @@ apply_fifa_r32_mapping <- function(top2_vec, thirds_vec) {
 }
 
 # Try authoritative mapping first, else fall back to greedy swap
-bracket32 <- apply_fifa_r32_mapping(top2$team, thirds) 
+bracket32 <- apply_fifa_r32_mapping(top2$team, thirds$team) 
 if (is.null(bracket32)) {
   # Fallback: original naive concatenation with greedy swaps to avoid same-group
-  bracket32 <- c(top2$team, thirds)
+  bracket32 <- c(top2$team, thirds$team)
   stopifnot(length(bracket32) == 32)
   fix_round32_pairs <- function(br) {
     br <- as.character(br)
@@ -1272,97 +1353,233 @@ cat("  Saved: bracket_knockout.csv\n\n")
 
 
 ################################################################################
-##  BLOCK 4C – Tournament tree plot
+##  BLOCK 4C – Tournament tree plot (neon glass, corrected scale)
 ################################################################################
 
 cat("── Block 4C  Bracket tree plot ───────────────────\n")
 
-## Assign x = round index, y = slot position, with parent y = mean of children y
-ko <- bracket_knockout |>
-  dplyr::mutate(round_no = match(stage, round_names))
-
+ko <- bracket_knockout |> dplyr::mutate(round_no = match(stage, round_names))
 n_rounds <- max(ko$round_no)
-## y-positions: Round of 32 gets 16 evenly spaced slots; each later round's
-## slot y = average of the two feeding slots (classic bracket layout)
+
 slots <- list()
 slots[[1]] <- ko |> dplyr::filter(round_no == 1) |>
-  dplyr::mutate(slot = dplyr::row_number(),
-                y    = rev(seq_len(dplyr::n())))
+  dplyr::mutate(slot = dplyr::row_number(), y = rev(seq_len(dplyr::n())) * 2.6)
 for (r in 2:n_rounds) {
   prev <- slots[[r - 1]]
   this <- ko |> dplyr::filter(round_no == r) |> dplyr::mutate(slot = dplyr::row_number())
-  this$y <- vapply(this$slot, function(s) {
-    mean(prev$y[c(2*s - 1, 2*s)])
-  }, numeric(1))
+  this$y <- vapply(this$slot, function(s) mean(prev$y[c(2*s - 1, 2*s)]), numeric(1))
   slots[[r]] <- this
 }
+
+## ---- Card sizing ----
+all_names <- unique(c(ko$team_a, ko$team_b))
+max_chars <- max(nchar(all_names), na.rm = TRUE)
+char_w    <- 0.11
+card_w    <- max(1.9, max_chars * char_w + 0.85)
+card_h    <- 0.95
+half_h    <- card_h / 2
+x_gap     <- card_w + 0.7
+
 plot_df <- dplyr::bind_rows(slots) |>
-  dplyr::mutate(x = round_no,
-                label_top = team_a, label_bot = team_b,
-                y_top = y + 0.18, y_bot = y - 0.18)
-
-## Connector segments: from each match's winner-y to the next round slot
-seg_df <- plot_df |>
-  dplyr::mutate(x_end = x + 1) |>
-  dplyr::group_by(round_no) |>
-  dplyr::mutate(next_slot = ceiling(dplyr::row_number() / 2)) |>
-  dplyr::ungroup()
-
-p_bracket <- ggplot2::ggplot() +
-  ggplot2::geom_segment(
-    data = plot_df, ggplot2::aes(x = x, xend = x + 0.9, y = y_top, yend = y_top),
-    colour = "grey70", linewidth = 0.4
-  ) +
-  ggplot2::geom_segment(
-    data = plot_df, ggplot2::aes(x = x, xend = x + 0.9, y = y_bot, yend = y_bot),
-    colour = "grey70", linewidth = 0.4
-  ) +
-  ggplot2::geom_text(
-    data = plot_df,
-    ggplot2::aes(x = x + 0.05, y = y_top,
-                 label = label_top,
-                 fontface = ifelse(label_top == winner, "bold", "plain"),
-                 colour  = ifelse(label_top == winner, "#2A9D8F", "grey30")),
-    hjust = 0, size = 3.0, vjust = -0.4
-  ) +
-  ggplot2::geom_text(
-    data = plot_df,
-    ggplot2::aes(x = x + 0.05, y = y_bot,
-                 label = label_bot,
-                 fontface = ifelse(label_bot == winner, "bold", "plain"),
-                 colour  = ifelse(label_bot == winner, "#2A9D8F", "grey30")),
-    hjust = 0, size = 3.0, vjust = 1.2
-  ) +
-  ggplot2::geom_text(
-    data = plot_df,
-    ggplot2::aes(x = x + 0.45, y = (y_top + y_bot) / 2,
-                 label = scales::percent(pmax(prob_a, 1 - prob_a), accuracy = 1)),
-    size = 2.2, colour = "grey45"
-  ) +
-  ggplot2::geom_point(data = plot_df, ggplot2::aes(x = x + 0.9, y = (y_top + y_bot)/2, colour = winner), size = 1.8, show.legend = FALSE) +
-  ggplot2::scale_colour_identity() +
-  ggplot2::scale_x_continuous(
-    breaks = seq_len(n_rounds), labels = round_names[seq_len(n_rounds)],
-    limits = c(0.8, n_rounds + 1.6)
-  ) +
-  ggplot2::scale_y_continuous(breaks = NULL) +
-  ggplot2::labs(
-    title    = "WC 2026 – Most Likely Bracket Path",
-    subtitle = glue::glue("Predicted champion: {champion}  |  ",
-                          "Each match shows the favourite's win probability"),
-    x = NULL, y = NULL
-  ) +
-  ggplot2::theme_minimal(base_size = 11) +
-  ggplot2::theme(
-    panel.grid      = ggplot2::element_blank(),
-    axis.text.x     = ggplot2::element_text(face = "bold"),
-    plot.title      = ggplot2::element_text(face = "bold", size = 14)
+  dplyr::mutate(
+    x      = (round_no - 1) * x_gap,
+    y_top  = y + half_h,
+    y_bot  = y - half_h,
+    label_top = team_a,
+    label_bot = team_b,
+    is_champ_top  = (team_a == champion),
+    is_champ_bot  = (team_b == champion),
+    is_champ_card = is_champ_top | is_champ_bot
   )
 
+## ---- Palette ----
+col_bg       <- "#08070D"
+col_grid     <- "#15131F"
+col_card     <- "#15131F"
+col_card_hi  <- "#1E1430"
+col_text     <- "#F2EFFA"
+col_text_dim <- "#7E7793"
+col_cyan     <- "#36F2D6"
+col_magenta  <- "#FF3DAE"
+col_gold     <- "#FFD166"
+col_line     <- "#2B2740"
+
+connector_df <- plot_df |>
+  dplyr::filter(round_no < n_rounds) |>
+  dplyr::mutate(x_start = x + card_w, y_mid = (y_top + y_bot) / 2, x_end = x + x_gap)
+
+next_y <- plot_df |>
+  dplyr::filter(round_no > 1) |>
+  dplyr::mutate(y_mid_next = (y_top + y_bot) / 2) |>
+  dplyr::group_by(round_no) |>
+  dplyr::mutate(slot2 = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+build_curve_targets <- function(connector_df, next_y) {
+  out <- connector_df
+  out$y_end <- NA_real_
+  out$is_champ_path <- FALSE
+  for (i in seq_len(nrow(out))) {
+    r  <- out$round_no[i]
+    sl <- out$slot[i]
+    target_slot <- ceiling(sl / 2)
+    tgt <- next_y |> dplyr::filter(round_no == r + 1, slot2 == target_slot)
+    if (nrow(tgt) == 1) {
+      out$y_end[i] <- tgt$y_mid_next
+      out$is_champ_path[i] <- out$is_champ_card[i] && tgt$is_champ_card
+    }
+  }
+  out
+}
+connector_df <- build_curve_targets(connector_df, next_y)
+
+grid_x <- seq(-0.5, max(plot_df$x) + x_gap * 1.9, by = x_gap / 3)
+grid_y <- seq(min(plot_df$y_bot) - 1.3, max(plot_df$y_top) + 2.8, by = 0.65)
+
+header_df <- tibble::tibble(
+  x     = unique(plot_df$x) + card_w / 2,
+  label = toupper(round_names[seq_len(n_rounds)])
+)
+
+champ_band <- plot_df |> dplyr::filter(round_no == n_rounds)
+champ_y    <- mean(c(champ_band$y_top, champ_band$y_bot))
+champ_x    <- max(plot_df$x) + x_gap
+
+champ_label_w <- nchar(toupper(champion)) * (char_w + 0.04) + 1.1
+x_limit_hi    <- champ_x + max(2.6, champ_label_w)
+x_limit_lo    <- -0.45
+y_limit_lo    <- min(plot_df$y_bot) - 1.3
+y_limit_hi    <- max(plot_df$y_top) + 2.6
+
+## total content span — used to size the canvas so font-to-canvas ratio stays constant
+content_w <- x_limit_hi - x_limit_lo
+content_h <- y_limit_hi - y_limit_lo
+
+p_bracket <- ggplot2::ggplot() +
+  ggplot2::theme_void(base_size = 14) +
+  ggplot2::theme(
+    plot.background  = ggplot2::element_rect(fill = col_bg, colour = NA),
+    panel.background = ggplot2::element_rect(fill = col_bg, colour = NA),
+    plot.title    = ggplot2::element_text(colour = col_text, face = "bold", size = 30, hjust = 0.5,
+                                           margin = ggplot2::margin(b = 6)),
+    plot.subtitle = ggplot2::element_text(colour = col_text_dim, size = 16, hjust = 0.5,
+                                           margin = ggplot2::margin(b = 26)),
+    plot.margin   = ggplot2::margin(28, 36, 28, 30)
+  ) +
+
+  ggplot2::geom_vline(xintercept = grid_x, colour = col_grid, linewidth = 0.28) +
+  ggplot2::geom_hline(yintercept = grid_y, colour = col_grid, linewidth = 0.2) +
+
+  ggplot2::geom_text(
+    data = header_df,
+    ggplot2::aes(x = x, y = max(plot_df$y_top) + 2.05, label = label),
+    colour = col_cyan, fontface = "bold", size = 6.4, family = "mono"
+  ) +
+  ggplot2::geom_segment(
+    data = header_df,
+    ggplot2::aes(x = x - card_w * 0.45, xend = x + card_w * 0.45,
+                 y = max(plot_df$y_top) + 1.5, yend = max(plot_df$y_top) + 1.5),
+    colour = col_cyan, linewidth = 1, alpha = 0.5
+  ) +
+
+  ggplot2::geom_curve(
+    data = dplyr::filter(connector_df, !is.na(y_end), !is_champ_path),
+    ggplot2::aes(x = x_start, y = y_mid, xend = x_end, yend = y_end),
+    colour = col_line, curvature = 0.22, linewidth = 0.8
+  ) +
+  ggplot2::geom_curve(
+    data = dplyr::filter(connector_df, !is.na(y_end), is_champ_path),
+    ggplot2::aes(x = x_start, y = y_mid, xend = x_end, yend = y_end),
+    colour = col_magenta, curvature = 0.22, linewidth = 2.0, alpha = 0.85
+  ) +
+  ggplot2::geom_curve(
+    data = dplyr::filter(connector_df, !is.na(y_end), is_champ_path),
+    ggplot2::aes(x = x_start, y = y_mid, xend = x_end, yend = y_end),
+    colour = col_cyan, curvature = 0.22, linewidth = 0.7, alpha = 0.9
+  ) +
+
+  ggplot2::geom_rect(
+    data = dplyr::filter(plot_df, !is_champ_card),
+    ggplot2::aes(xmin = x, xmax = x + card_w, ymin = y_bot, ymax = y_top),
+    fill = col_card, colour = col_line, linewidth = 0.6
+  ) +
+  ggplot2::geom_rect(
+    data = dplyr::filter(plot_df, is_champ_card),
+    ggplot2::aes(xmin = x, xmax = x + card_w, ymin = y_bot, ymax = y_top),
+    fill = col_card_hi, colour = col_magenta, linewidth = 1.4
+  ) +
+
+  ggplot2::geom_segment(
+    data = plot_df,
+    ggplot2::aes(x = x + 0.06, xend = x + card_w - 0.06, y = y, yend = y),
+    colour = col_line, linewidth = 0.45
+  ) +
+
+  ggplot2::geom_segment(
+    data = plot_df,
+    ggplot2::aes(x = x, xend = x, y = y_bot + 0.06, yend = y,
+                 colour = ifelse(prob_a >= 0.5, col_cyan, col_line)),
+    linewidth = 3.8
+  ) +
+  ggplot2::geom_segment(
+    data = plot_df,
+    ggplot2::aes(x = x, xend = x, y = y, yend = y_top - 0.06,
+                 colour = ifelse(prob_a < 0.5, col_cyan, col_line)),
+    linewidth = 3.8
+  ) +
+
+  ## team names — substantially larger, this is the key readability fix
+  ggplot2::geom_text(
+    data = plot_df,
+    ggplot2::aes(x = x + 0.22, y = y_top - 0.24, label = label_top,
+                 colour = ifelse(label_top == champion, col_gold, col_text),
+                 fontface = ifelse(label_top == champion, "bold", "plain")),
+    hjust = 0, size = 6.2
+  ) +
+  ggplot2::geom_text(
+    data = plot_df,
+    ggplot2::aes(x = x + 0.22, y = y_bot + 0.24, label = label_bot,
+                 colour = ifelse(label_bot == champion, col_gold, col_text),
+                 fontface = ifelse(label_bot == champion, "bold", "plain")),
+    hjust = 0, size = 6.2
+  ) +
+
+  ggplot2::geom_label(
+    data = plot_df,
+    ggplot2::aes(x = x + card_w - 0.10, y = y,
+                 label = scales::percent(pmax(prob_a, 1 - prob_a), accuracy = 1)),
+    hjust = 1, size = 4.4, colour = col_cyan, fill = col_bg,
+    label.size = 0, label.padding = ggplot2::unit(0.14, "lines")
+  ) +
+
+  ggplot2::scale_colour_identity() +
+
+  ggplot2::annotate("point", x = champ_x + 0.1, y = champ_y, size = 58, colour = col_magenta, alpha = 0.06) +
+  ggplot2::annotate("point", x = champ_x + 0.1, y = champ_y, size = 38, colour = col_cyan,    alpha = 0.10) +
+  ggplot2::annotate("text",  x = champ_x, y = champ_y + 0.55, label = "\U0001F3C6", size = 15, hjust = 0) +
+  ggplot2::annotate("text",  x = champ_x, y = champ_y - 0.55, label = toupper(champion),
+                     colour = col_gold, fontface = "bold", size = 9.4, hjust = 0) +
+  ggplot2::annotate("text",  x = champ_x, y = champ_y - 1.0, label = "WORLD CHAMPION",
+                     colour = col_cyan, fontface = "bold", size = 4.4, hjust = 0, family = "mono") +
+
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::scale_x_continuous(limits = c(x_limit_lo, x_limit_hi), expand = c(0, 0)) +
+  ggplot2::scale_y_continuous(limits = c(y_limit_lo, y_limit_hi), expand = c(0, 0)) +
+  ggplot2::labs(
+    title    = "2026 FIFA World Cup \u2014 Most Likely Path",
+    subtitle = paste0("Predicted champion: ", champion,
+                       "   \u00b7   numbers show the favourite's win probability per match")
+  )
+
+## ---- Canvas sized to match content's aspect ratio, not an arbitrary formula ----
+## Fix the per-unit scale (inches per content-unit), so font-to-canvas ratio is stable
+units_per_inch <- 1.55
+ggsave_w <- content_w / units_per_inch
+ggsave_h <- content_h / units_per_inch + 1.5   # +1.5" for title/subtitle margin
+
 ggplot2::ggsave("wc2026_output/bracket_tree.png", p_bracket,
-                width = 16, height = 10, dpi = 150)
-cat("  Saved: bracket_tree.png\n")
-cat("\n══════════════════════════════════════════════════\n")
+                width = ggsave_w, height = ggsave_h, dpi = 220, bg = col_bg)
+cat("  Saved: bracket_tree.png, canvas", round(ggsave_w,1), "x", round(ggsave_h,1), "in\n")
 cat(" Most-likely-path bracket complete. Champion:", champion, "\n")
 cat("══════════════════════════════════════════════════\n")
 

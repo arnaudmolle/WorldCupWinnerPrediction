@@ -855,7 +855,36 @@ if (!is.null(raw_players) && ok_players) {
 }
 
 cat("\n")
+## ── Contribution / ponderation audit ──────────────────────────────────────
+## Decomposes team_strength into its weighted components so any "odd" team
+## ranking can be justified (or challenged) by inspecting which term drives it,
+## rather than trusting team_strength as an opaque single number.
+w_np <- weights_no_players
+w_wp <- weights_with_players
 
+team_features <- team_features |>
+  dplyr::mutate(
+    contrib_elo        = dplyr::if_else(has_player_data, w_wp$elo,        w_np$elo)        * elo_sc,
+    contrib_attack     = dplyr::if_else(has_player_data, w_wp$attack,     w_np$attack)     * attack_str,
+    contrib_defence    = dplyr::if_else(has_player_data, w_wp$defence,    w_np$defence)    * defence_str,
+    contrib_form       = dplyr::if_else(has_player_data, w_wp$form_last5, w_np$form_last5) * form_sc,
+    contrib_pagerank   = dplyr::if_else(has_player_data, w_wp$pagerank,   w_np$pagerank)   * pr_sc,
+    contrib_qualifier  = dplyr::if_else(has_player_data, w_wp$qualifier,  w_np$qualifier)  * q_sc,
+    contrib_player_att = dplyr::if_else(has_player_data, w_wp$player_attack  %||% 0, 0) * player_attack_sc,
+    contrib_player_def = dplyr::if_else(has_player_data, w_wp$player_defence %||% 0, 0) * player_defence_sc,
+    contrib_check_sum  = contrib_elo + contrib_attack + contrib_defence + contrib_form +
+                          contrib_pagerank + contrib_qualifier + contrib_player_att + contrib_player_def
+  )
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+contribution_audit <- team_features |>
+  dplyr::select(team, team_strength, contrib_check_sum, dplyr::starts_with("contrib_")) |>
+  dplyr::arrange(dplyr::desc(team_strength))
+
+readr::write_csv(contribution_audit, file.path(OUT_DIR, "team_strength_contributions.csv"))
+cat("  Saved: team_strength_contributions.csv (per-team weighted breakdown)\n")
+cat("  ⚠  Sanity check: contrib_check_sum should equal team_strength for every row.\n")
+cat("     Max discrepancy:", round(max(abs(contribution_audit$team_strength - contribution_audit$contrib_check_sum)), 4), "\n")
 
 ################################################################################
 ##  SECTION 7 – Final validation & save
