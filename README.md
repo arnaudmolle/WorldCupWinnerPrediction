@@ -245,15 +245,26 @@ the dataset (Big-5 European leagues + any other covered league).
 ### Composite `team_strength` (0–1)
 
 ```
-0.30 × elo_sc
-0.15 × attack_str      (w_gf rescaled)
-0.15 × defence_str     (−w_ga rescaled)
-0.10 × form_sc
-0.10 × pagerank_sc
-0.05 × qualifier_sc
-0.10 × player_attack_sc  (goals_p90 + xg_p90, rescaled)
-0.05 × player_defence_sc (tackles_p90 + int_p90, rescaled)
+0.30 × `elo_sc`
+0.15 × `attack_str`      (w_gf rescaled)
+0.15 × `defence_str`     (−w_ga rescaled)
+0.10 × `form_sc`
+0.10 × `pr_sc` (PageRank)
+0.05 × `q_sc` (qualifier points)
+0.10 × `player_attack_sc`  (goals_p90 + xg_p90, rescaled)
+0.05 × `player_defence_sc` (tackles_p90 + interceptions_p90, rescaled)
 ```
+
+Parameters affecting `team_strength`:
+
+- **Weights (`team_strength_weights`)**: Two weight sets exist in `config.yaml` — `without_player_data` and `with_player_data`. These control the relative contribution of each normalized component (Elo, attack/defence, form, PageRank, qualifier stats, and optional player terms). Change these values to rebalance the composite score; each block should sum to 1.0.
+- **Global rescaling (`global_rescale`)**: When `TRUE` (in `config.yaml`), component scores such as `elo_sc`, `attack_str`, `defence_str`, `form_sc`, `pr_sc`, and `q_sc` are rescaled against a global international pool rather than only the 48 finalists. Enabling this reduces regional inflation for teams from weak confederations. The repository `config.yaml` default is `true`; if no `config.yaml` is present, `fetch_data.R` falls back to a script-default of `FALSE`/`TRUE` depending on the script version—use the repo `config.yaml` to control behaviour reliably.
+- **Shrinkage (`shrinkage_tau`)**: Empirical-Bayes shrinkage is applied to weighted goals-for (`w_gf`) and goals-against (`w_ga`) before rescaling. Higher `shrinkage_tau` pulls small-sample teams toward the global mean, stabilising estimates for nations with few recent matches. The recommended default in `config.yaml` is `10` (the code also provides a lower fallback if `config.yaml` is absent).
+- **Player terms**: `player_attack_sc` and `player_defence_sc` are built from per-90 squad aggregates (`goals_p90`, `xg_p90`, `tackles_p90`, `interceptions_p90`) and rescaled to 0–1. Teams without player coverage receive filled median values and are marked `has_player_data = FALSE` (see `player_nation_coverage.csv`).
+- **Auditability**: The pipeline writes `wc2026_output/team_strength_contributions.csv`, which decomposes each team's `team_strength` into the weighted components so you can inspect which terms drive any given ranking.
+
+Note: there are two main driver scripts in the repo: `fetch_data.R` (data + features) and `predict_wc2026.R` (models + simulation + visualisations). An alternative one-file run is provided as `simulate.R` which mirrors the modelling and plotting steps; prefer `predict_wc2026.R` when using the `run_mode` switch (`fetch` / `simulate` / `all`) or when you want the worldfootballR-based data fetch. Use `config.yaml` at the repo root to control weights, rescaling, and other tunables — the scripts will read it automatically and override the internal defaults.
+
 
 ---
 
